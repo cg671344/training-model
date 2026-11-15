@@ -95,3 +95,42 @@ CMD hvac.kitchen.temp := 22C;
 # 5. （可选）运行第二阶段 DPO 偏好对齐
 .venv\Scripts\python.exe 05_train_dpo.py
 ```
+
+---
+
+## 5. 核心原理解析（面向初学者的深度拆解）
+
+### 5.1 为什么只对“回答部分”计算 Loss？（Completion-Only Loss Masking）
+
+在样本 #0（共 107 个 Token）中，前 85 个系统提示词与用户输入 Token 的标签全部被掩码设为 `label = -100`，使 100% 的梯度更新都集中在最后 22 个目标输出 Token（`@NEXUS_V1\nCMD hvac.study.temp := 22C;\n@END`）上。
+
+- **背景知识：** 训练语言模型时，我们会把整段对话拼成 Token ID 序列，同时准备一份标准答案列表 `labels`。PyTorch 的 `CrossEntropyLoss` 规定：**只要 `labels` 中某一位是 `-100`，计算 Loss 时就会自动跳过该位置，不产生梯度。**
+- **为什么需要掩码：** 一条样本包含两段：
+  - **前 85 个 Token（考题）：** System Prompt + User 提问 + `<|im_start|>assistant`
+  - **后 22 个 Token（答案）：** `@NEXUS_V1\nCMD hvac.study.temp := 22C;\n@END<|im_end|>`
+- 如果不把前 85 个 Token 设为 `-100`，模型就会被迫把 80% 的算力浪费在“背诵题干”上，就像考试时要求学生连题目一起默写。在 [`03_train_sft.py`](./03_train_sft.py) 的 `CompletionOnlySFTDataset` 中，我们通过：
+  ```python
+  labels = [-100] * len(prompt_ids) + full_ids[len(prompt_ids):]
+  ```
+  让模型完整阅读前面的上下文，但**只考核并优化最后 22 个答案 Token 的预测准确率**。
+
+### 5.2 为什么原始基座模型写完 `@END` 后不肯停止？（未训练的特殊结束符）
+
+大模型没有“发完消息自动停机”的本能，它必须自己生成一个特殊的**结束符号（EOS Token）**，推理框架（`model.generate`）检测到这个 ID 后才会停止生成。
+
+在原始 `Qwen/Qwen2.5-0.5B` 基座模型中：
+- **基座模型预训练用的结束符：** `<|endoftext|>`（ID `151643`），用于分隔互联网网页文本。
+- **ChatML 对话模板用的结束符：** `<|im_end|>`（ID `151645`），用于标记一轮助手回答结束。在未经过对话微调的原始基座模型中，`<|im_end|>` 几乎从未被激活。
+- **LoRA 的默认冻结机制：** 大模型结构分为入口词表（`embed_tokens`）→ 中间 Transformer 层 → 出口输出头（`lm_head`）。LoRA 默认只微调中间层，**冻结了 `embed_tokens` 和 `lm_head`**。这导致模型虽然在中间层学会了“写完 `@END` 就该结束”，但出口输出头里 `<|im_end|>` 的概率权重依然是冻住的，无法主动吐出它，于是只能继续往下胡言乱语。
+- **两种解决方法：**
+  1. **推理侧拦截（[`04_eval_after.py`](./04_eval_after.py) 采用）：** 在 `model.generate(...)` 中传入 `stop_strings=["@END"]`，一旦生成 `@END` 立即强制截断。
+  2. **训练侧解冻（治本方案）：** 在 `LoraConfig` 中加入 `modules_to_save=["embed_tokens", "lm_head"]`，允许输出头一起更新权重，让模型真正学会自己在结尾吐出 `<|im_end|>`（代价是可训练参数与显存占用会有所增加）。
+
+### 5.3 如何通过错误分析定位数据分布不均？（`sec.house.alarm` vs `sec.all.alarm`）
+
+在 20 道测试题中，第 8 题（*"Arm the security alarm for the entire house."*）和第 12 题（*"Turn off every light in the whole house."*）均出现了同一类错误：模型输出了 `sec.house.alarm` 和 `lum.house.main`，而不是合法的 `sec.all.alarm` 与 `lum.all.main`。
+
+- **根因定位：** 回查 [`01_prepare_data.py`](./01_prepare_data.py) 中的样本分布可以发现，6 个具体房间（`kitchen`、`bedroom`、`living`、`study`、`garage`、`porch`）各有约 **40 条**训练样本，模型被充分训练去学习“房间词 → 区域 ID”的映射；而全屋区域 `all` 在整个训练集中只有 **6 条**样本。
+- **模型行为退化：** 因为 `all` 的样本太少，模型在测试集遇到未见过的 `"entire house"` / `"whole house"` 时，无法稳定映射到 `all`，只能退化为**直接照抄英文名词 `house`** 填入区域槽位。
+- **工程启示：** 后训练阶段遇到特定场景出错时，**先做错误分析定位数据短板，往往比盲目调学习率或增加 Epoch 更有效**。只需在 [`01_prepare_data.py`](./01_prepare_data.py) 中为 `all` 区域补充 15~20 条多样化表达（如 *"entire house"*、*"whole home"*、*"all rooms"*）并重跑训练即可直接修复。
+

@@ -95,3 +95,42 @@ CMD hvac.kitchen.temp := 22C;
 # 5. (Optional) Run Stage 2 DPO preference alignment
 .venv\Scripts\python.exe 05_train_dpo.py
 ```
+
+---
+
+## 5. Deep Dive: Understanding the Three Key Lessons
+
+### 5.1 Why Mask Prompt Tokens with `label = -100`? (Completion-Only Loss Masking)
+
+In Sample #0 (107 total tokens), the first 85 system prompt and user input tokens are masked with `label = -100`, focusing 100% of gradient updates on the final 22 target tokens (`@NEXUS_V1\nCMD hvac.study.temp := 22C;\n@END`).
+
+- **How Cross-Entropy Loss Works:** During causal LM training, we feed the full sequence of token IDs alongside a matching `labels` array. In PyTorch's `CrossEntropyLoss`, any position with `label = -100` is **ignored** and contributes zero loss and zero gradient.
+- **Why Masking Matters:** Each training example consists of two parts:
+  - **First 85 tokens (Prompt / Question):** System prompt + User message + `<|im_start|>assistant`
+  - **Last 22 tokens (Completion / Answer):** `@NEXUS_V1\nCMD hvac.study.temp := 22C;\n@END<|im_end|>`
+- Without masking, the model would spend ~80% of its capacity memorizing the system prompt and user phrasing instead of learning the `NEXUS-DSL v1` syntax. In [`03_train_sft.py`](./03_train_sft.py) (`CompletionOnlySFTDataset`), we set:
+  ```python
+  labels = [-100] * len(prompt_ids) + full_ids[len(prompt_ids):]
+  ```
+  so the model still reads the full prompt as context, while loss is computed **exclusively on the assistant's 22 answer tokens**.
+
+### 5.2 Why Didn't the Model Stop After `@END`? (Untrained Special Tokens in Base Models)
+
+Language models do not automatically know when to stop generating; they must emit a special **End-of-Sequence (EOS) token** that `model.generate()` watches for.
+
+In the raw `Qwen/Qwen2.5-0.5B` base model:
+- **Pre-training EOS token:** `<|endoftext|>` (ID `151643`), used to separate raw web documents.
+- **ChatML turn-end token:** `<|im_end|>` (ID `151645`), used to end an assistant turn. In an unaligned base model, `<|im_end|>` has rarely been trained as an assistant stop signal.
+- **Why LoRA Didn't Fix It Automatically:** A transformer consists of `embed_tokens` (input vocabulary) → middle Transformer layers → `lm_head` (output vocabulary projection). By default, LoRA only adapts the middle attention/MLP layers and **freezes `embed_tokens` and `lm_head`**. So even after the middle layers learned to stop after `@END`, the frozen `lm_head` still assigned near-zero probability to `<|im_end|>`, causing the model to keep rambling past `@END`.
+- **Two Ways to Fix This:**
+  1. **Inference-time stop string (used in [`04_eval_after.py`](./04_eval_after.py)):** Pass `stop_strings=["@END"]` to `model.generate(...)` to halt generation cleanly as soon as `@END` is emitted.
+  2. **Training-time unfreezing:** Set `modules_to_save=["embed_tokens", "lm_head"]` in `LoraConfig` so the output head learns to emit `<|im_end|>` natively (at the cost of slightly higher VRAM and trainable parameter count).
+
+### 5.3 Diagnosing Data Imbalance via Error Analysis (`sec.house.alarm` vs `sec.all.alarm`)
+
+On the 20 held-out test cases, the only 2 syntax errors—Test #08 (*"Arm the security alarm for the entire house."*) and Test #12 (*"Turn off every light in the whole house."*)—failed identically: the model emitted `sec.house.alarm` and `lum.house.main` instead of `sec.all.alarm` and `lum.all.main`.
+
+- **Root Cause:** Inspecting [`01_prepare_data.py`](./01_prepare_data.py) shows that each of the 6 named rooms (`kitchen`, `bedroom`, `living`, `study`, `garage`, `porch`) appears in **~40 training examples**, whereas the whole-house `all` zone appears in **only 6 examples**.
+- **Fallback Behavior:** Because `all` was severely underrepresented, when the model encountered unseen phrasings like *"entire house"* or *"whole house"*, it fell back to copying the English noun `house` directly into the zone slot.
+- **Key Takeaway:** In post-training, **fixing data coverage via error analysis is far more effective than tuning learning rates or adding epochs**. Adding 15–20 varied `all`-zone examples (e.g., *"entire house"*, *"whole home"*, *"all rooms"*) in [`01_prepare_data.py`](./01_prepare_data.py) directly resolves this failure mode.
+
