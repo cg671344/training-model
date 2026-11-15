@@ -1,5 +1,7 @@
 # Hands-On LLM Post-Training Pipeline (`NEXUS-DSL v1`)
 
+English | [简体中文](./readme_zh.md)
+
 This project demonstrates the complete end-to-end **Post-Training** procedure on a Base Foundation Model (`Qwen/Qwen2.5-0.5B`) running locally on an **NVIDIA GTX 1650 (4 GB VRAM)**.
 
 ## Why This Task? ("Before vs. After" Capability)
